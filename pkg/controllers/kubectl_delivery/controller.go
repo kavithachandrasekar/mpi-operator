@@ -245,7 +245,7 @@ func (c *KubectlDeliveryController) processNextWorkItem() bool {
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
 		c.queue.Forget(obj)
-		klog.Infof("Successfully synced '%s'", key)
+		klog.Infof("t4-Successfully synced '%s'", key)
 		return nil
 	}(obj)
 
