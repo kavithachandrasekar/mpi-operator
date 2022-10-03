@@ -155,6 +155,11 @@
           "type": "integer",
           "format": "int32"
         }
+        "shrinkWorkers": {
+          "description": "Specifies the number of worker to shrink to. Defaults to 1.",
+          "type": "integer",
+          "format": "int32"
+        }
       }
     },
     "v1.ReplicaSpec": {

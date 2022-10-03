@@ -64,6 +64,9 @@ spec:
               slotsPerWorker:
                 minimum: 1
                 type: integer
+              shrinkWorkers:
+                minimum: 1
+                type: integer
             type: object
             x-kubernetes-preserve-unknown-fields: true
           status:
@@ -99,6 +102,9 @@ spec:
                     x-kubernetes-preserve-unknown-fields: true
                 type: object
               slotsPerWorker:
+                minimum: 1
+                type: integer
+              shrinkWorkers:
                 minimum: 1
                 type: integer
             type: object
@@ -185,6 +191,9 @@ spec:
                     type: integer
                 type: object
               slotsPerWorker:
+                minimum: 1
+                type: integer
+              shrinkWorkers:
                 minimum: 1
                 type: integer
               sshAuthMountPath:
@@ -480,6 +489,6 @@ spec:
         - -alsologtostderr
         - --lock-namespace
         - mpi-operator
-        image: mpioperator/mpi-operator:latest
+        image: kchndrs2/mpi-operator:dev2
         name: mpi-operator
       serviceAccountName: mpi-operator
