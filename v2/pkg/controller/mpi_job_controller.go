@@ -240,6 +240,8 @@ type MPIJobController struct {
 	recorder record.EventRecorder
 	// Gang scheduler name to use
 	gangSchedulerName string
+  poolIndex int
+  podPool [5]string
 
 	// To allow injection of updateStatus for testing.
 	updateStatusHandler func(mpijob *kubeflow.MPIJob) error
@@ -297,8 +299,10 @@ func NewMPIJobController(
 	}
 
 	controller.updateStatusHandler = controller.doUpdateJobStatus
+  controller.poolIndex = 0
 
-	klog.Info("Setting up event handlers")
+  msg := fmt.Sprintf("%d workers in pool", controller.poolIndex)
+	klog.Infof("t1-Setting up event handlers %v", msg)
 	// Set up an event handler for when MPIJob resources change.
 	mpiJobInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.addMPIJob,
@@ -433,7 +437,7 @@ func (c *MPIJobController) processNextWorkItem() bool {
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
 		c.queue.Forget(obj)
-		klog.Infof("t11-Successfuly synced '%s'", key)
+		klog.Infof("t12-Successfuly synced '%s'", key)
 		return nil
 	}(obj)
 
@@ -556,10 +560,17 @@ func (c *MPIJobController) syncHandler(key string) error {
 			}
 		}
 
+		shrinkStr := strconv.Itoa(int(*mpiJob.Spec.ShrinkWorkers))
+		klog.Infof("Shrink workers '%s'", shrinkStr)
 		worker, err = c.getOrCreateWorker(mpiJob)
 		if err != nil {
 			return err
 		}
+/*
+		if int(*mpiJob.Spec.ShrinkWorkers) > 0 {
+			c.deleteWorkerPodsByCount(mpiJob, int(*mpiJob.Spec.ShrinkWorkers))
+		}
+*/
 		if mpiJob.Spec.MPIImplementation == kubeflow.MPIImplementationIntel {
 			// The Intel implementation requires workers to communicate with the
 			// launcher through its hostname. For that, we create a Service which
@@ -797,6 +808,8 @@ func keysFromData(data map[string][]byte) []string {
 // MPIJob, or creates one if it doesn't exist.
 func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1.Pod, error) {
 	var workerPods []*corev1.Pod
+  var i            int = 0
+  var alreadyAdded int = 0
 	worker := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeWorker]
 	if worker == nil {
 		return workerPods, nil
@@ -820,16 +833,33 @@ func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1
 			index, err := strconv.Atoi(indexStr)
 			if err == nil {
 				if index >= int(*worker.Replicas) {
-					err = c.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
-					if err != nil {
-						return nil, err
-					}
+//					err = c.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+          for ; i < c.poolIndex; i++ {
+            klog.Infof("Compare %s and %s", c.podPool[i], pod.Name)
+            if c.podPool[i] == pod.Name {
+              alreadyAdded = 1
+              break
+            }
+          }
+          if alreadyAdded == 0 {
+            c.podPool[c.poolIndex] = pod.Name
+            c.poolIndex = c.poolIndex+1
+            klog.Infof("Adding pod %s to pool",c.podPool[c.poolIndex-1])
+            if err != nil {
+              return nil, err
+            }
+          }
 				}
 			}
 		}
-	}
-
-	for i := 0; i < int(*worker.Replicas); i++ {
+    i = 0
+	} else {
+    if c.poolIndex > 0 {
+      klog.Infof("MPI job %s going to reuse % from pool", mpiJob.Name, c.podPool[0])
+      i = c.poolIndex
+    }
+  }
+	for ; i < int(*worker.Replicas); i++ {
 		pod, err := c.podLister.Pods(mpiJob.Namespace).Get(workerName(mpiJob, i))
 
 		// If the worker Pod doesn't exist, we'll create it.
@@ -868,6 +898,50 @@ func (c *MPIJobController) deleteWorkerPods(mpiJob *kubeflow.MPIJob) error {
 	}
 
 	for ; i < *worker.Replicas; i++ {
+		name := fmt.Sprintf("%s-%d", workerPrefix, i)
+		pod, err := c.podLister.Pods(mpiJob.Namespace).Get(name)
+
+		// If the worker Pod doesn't exist, no need to remove it.
+		if errors.IsNotFound(err) {
+			continue
+		}
+		// If the worker is not controlled by this MPIJob resource, we should log
+		// a warning to the event recorder and return.
+		if pod != nil && !metav1.IsControlledBy(pod, mpiJob) {
+			msg := fmt.Sprintf(MessageResourceExists, pod.Name, pod.Kind)
+			c.recorder.Event(mpiJob, corev1.EventTypeWarning, ErrResourceExists, msg)
+			return fmt.Errorf(msg)
+		}
+		// If the worker pod is not running and cleanupPolicy is
+		// set to CleanPodPolicyRunning, keep the pod.
+		// Note that pending pod should still be removed under this
+		// situation, since it may turn to running in the future.
+		if *mpiJob.Spec.RunPolicy.CleanPodPolicy == common.CleanPodPolicyRunning && !isPodRunning(pod) && !isPodPending(pod) {
+			// Keep the worker pod
+			continue
+		}
+		err = c.kubeClient.CoreV1().Pods(mpiJob.Namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+		if err != nil && !errors.IsNotFound(err) {
+			klog.Errorf("Failed to delete pod[%s/%s]: %v", mpiJob.Namespace, name, err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *MPIJobController) deleteWorkerPodsByCount(mpiJob *kubeflow.MPIJob, shrinkWorkerCount int) error {
+	worker := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeWorker]
+	var (
+		workerPrefix       = mpiJob.Name + workerSuffix
+		i            int32 = *worker.Replicas - 1
+	)
+
+	if worker == nil {
+		return nil
+	}
+
+	for ; i >= int32(shrinkWorkerCount); i-- {
+		klog.Infof("Deleting worker during shrink phase")
 		name := fmt.Sprintf("%s-%d", workerPrefix, i)
 		pod, err := c.podLister.Pods(mpiJob.Namespace).Get(name)
 

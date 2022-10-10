@@ -65,7 +65,7 @@ spec:
                 minimum: 1
                 type: integer
               shrinkWorkers:
-                minimum: 1
+                minimum: 0
                 type: integer
             type: object
             x-kubernetes-preserve-unknown-fields: true
@@ -489,6 +489,6 @@ spec:
         - -alsologtostderr
         - --lock-namespace
         - mpi-operator
-        image: kchndrs2/mpi-operator:dev2
+        image: kchndrs2/mpi-operator:dev24
         name: mpi-operator
       serviceAccountName: mpi-operator

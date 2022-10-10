@@ -43,6 +43,7 @@ type MPIJobSpec struct {
 	// +optional
 	// +kubebuilder:default:=1
 	SlotsPerWorker *int32 `json:"slotsPerWorker,omitempty"`
+	ShrinkWorkers  *int32 `json:"shrinkWorkers,omitempty"`
 
 	// RunPolicy encapsulates various runtime policies of the job.
 	RunPolicy common.RunPolicy `json:"runPolicy,omitempty"`

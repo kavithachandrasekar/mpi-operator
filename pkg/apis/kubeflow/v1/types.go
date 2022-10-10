@@ -43,7 +43,7 @@ type MPIJobSpec struct {
 	// Defaults to 1.
 	// +optional
 	SlotsPerWorker *int32 `json:"slotsPerWorker,omitempty"`
-  ShrinkWorkers *int32 `json:"shrinkWorkers,omitempty"`
+	ShrinkWorkers  *int32 `json:"shrinkWorkers,omitempty"`
 
 	// CleanPodPolicy defines the policy that whether to kill pods after the job completes.
 	// Defaults to None.
