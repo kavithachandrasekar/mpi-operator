@@ -489,6 +489,6 @@ spec:
         - -alsologtostderr
         - --lock-namespace
         - mpi-operator
-        image: kchndrs2/mpi-operator:dev24
+        image: kchndrs2/mpi-operator:dev27
         name: mpi-operator
       serviceAccountName: mpi-operator

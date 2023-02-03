@@ -242,6 +242,11 @@ type MPIJobController struct {
 	gangSchedulerName string
   poolIndex int
   podPool [5]string
+  jobName [5] string
+  valid [5] int
+  setKey int
+  privatePEM []byte
+  publicKey ssh.PublicKey
 
 	// To allow injection of updateStatus for testing.
 	updateStatusHandler func(mpijob *kubeflow.MPIJob) error
@@ -300,6 +305,7 @@ func NewMPIJobController(
 
 	controller.updateStatusHandler = controller.doUpdateJobStatus
   controller.poolIndex = 0
+  controller.setKey = 0
 
   msg := fmt.Sprintf("%d workers in pool", controller.poolIndex)
 	klog.Infof("t1-Setting up event handlers %v", msg)
@@ -701,7 +707,7 @@ func (c *MPIJobController) getRunningWorkerPods(mpiJob *kubeflow.MPIJob) ([]*cor
 // getOrCreateConfigMap gets the ConfigMap controlled by this MPIJob, or creates
 // one if it doesn't exist.
 func (c *MPIJobController) getOrCreateConfigMap(mpiJob *kubeflow.MPIJob) (*corev1.ConfigMap, error) {
-	newCM := newConfigMap(mpiJob, workerReplicas(mpiJob))
+	newCM := newConfigMap(c, mpiJob, workerReplicas(mpiJob))
 	podList, err := c.getRunningWorkerPods(mpiJob)
 	if err != nil {
 		return nil, err
@@ -767,7 +773,7 @@ func (c *MPIJobController) getOrCreateService(job *kubeflow.MPIJob, newSvc *core
 func (c *MPIJobController) getOrCreateSSHAuthSecret(job *kubeflow.MPIJob) (*corev1.Secret, error) {
 	secret, err := c.secretLister.Secrets(job.Namespace).Get(job.Name + sshAuthSecretSuffix)
 	if errors.IsNotFound(err) {
-		secret, err := newSSHAuthSecret(job)
+		secret, err := c.newSSHAuthSecret(job)
 		if err != nil {
 			return nil, err
 		}
@@ -781,7 +787,7 @@ func (c *MPIJobController) getOrCreateSSHAuthSecret(job *kubeflow.MPIJob) (*core
 		c.recorder.Event(job, corev1.EventTypeWarning, ErrResourceExists, msg)
 		return nil, fmt.Errorf(msg)
 	}
-	newSecret, err := newSSHAuthSecret(job)
+	newSecret, err := c.newSSHAuthSecret(job)
 	if err != nil {
 		return nil, fmt.Errorf("generating new secret: %w", err)
 	}
@@ -809,7 +815,7 @@ func keysFromData(data map[string][]byte) []string {
 func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1.Pod, error) {
 	var workerPods []*corev1.Pod
   var i            int = 0
-  var alreadyAdded int = 0
+//  var alreadyAdded int = 0
 	worker := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeWorker]
 	if worker == nil {
 		return workerPods, nil
@@ -834,6 +840,7 @@ func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1
 			if err == nil {
 				if index >= int(*worker.Replicas) {
 //					err = c.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+/*
           for ; i < c.poolIndex; i++ {
             klog.Infof("Compare %s and %s", c.podPool[i], pod.Name)
             if c.podPool[i] == pod.Name {
@@ -849,6 +856,7 @@ func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1
               return nil, err
             }
           }
+*/
 				}
 			}
 		}
@@ -1177,10 +1185,17 @@ func (c *MPIJobController) doUpdateJobStatus(mpiJob *kubeflow.MPIJob) error {
 // newConfigMap creates a new ConfigMap containing configurations for an MPIJob
 // resource. It also sets the appropriate OwnerReferences on the resource so
 // handleObject can discover the MPIJob resource that 'owns' it.
-func newConfigMap(mpiJob *kubeflow.MPIJob, workerReplicas int32) *corev1.ConfigMap {
+func newConfigMap(c *MPIJobController, mpiJob *kubeflow.MPIJob, workerReplicas int32) *corev1.ConfigMap {
 	var buffer bytes.Buffer
+  var i            int = 0
 	workersService := mpiJob.Name + workerSuffix
-	for i := 0; i < int(workerReplicas); i++ {
+  if c.poolIndex > 0 {
+      klog.Infof("MPI job %s going to reuse % from pool", mpiJob.Name, c.podPool[0])
+      i = c.poolIndex
+      buffer.WriteString(fmt.Sprintf("%s.%s.%s.svc\n", c.podPool[0], "pytorch-mpi-shrink-worker", mpiJob.Namespace))
+    }
+
+	for ; i < int(workerReplicas); i++ {
 		buffer.WriteString(fmt.Sprintf("%s%s-%d.%s.%s.svc\n", mpiJob.Name, workerSuffix, i, workersService, mpiJob.Namespace))
 	}
 
@@ -1249,24 +1264,29 @@ func newService(job *kubeflow.MPIJob, name string, selector map[string]string) *
 
 // newSSHAuthSecret creates a new Secret that holds SSH auth: a private Key
 // and its public key version.
-func newSSHAuthSecret(job *kubeflow.MPIJob) (*corev1.Secret, error) {
-	privateKey, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generating private SSH key: %w", err)
-	}
-	privateDER, err := x509.MarshalECPrivateKey(privateKey)
-	if err != nil {
-		return nil, fmt.Errorf("converting private SSH key to DER format: %w", err)
-	}
-	privatePEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "EC PRIVATE KEY",
-		Bytes: privateDER,
-	})
+func (c *MPIJobController)newSSHAuthSecret(job *kubeflow.MPIJob) (*corev1.Secret, error) {
+  if c.setKey == 0 {
+    c.setKey = 1
+	  lprivateKey, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+	  if err != nil {
+		  return nil, fmt.Errorf("generating private SSH key: %w", err)
+	  }
+    lprivateDER, err := x509.MarshalECPrivateKey(lprivateKey)
+    if err != nil {
+      return nil, fmt.Errorf("converting private SSH key to DER format: %w", err)
+    }
+    lprivatePEM := pem.EncodeToMemory(&pem.Block{
+      Type:  "EC PRIVATE KEY",
+      Bytes: lprivateDER,
+    })
 
-	publicKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("generating public SSH key: %w", err)
-	}
+    lpublicKey, err := ssh.NewPublicKey(&lprivateKey.PublicKey)
+    if err != nil {
+      return nil, fmt.Errorf("generating public SSH key: %w", err)
+    }
+    c.privatePEM = lprivatePEM
+    c.publicKey = lpublicKey
+  }
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      job.Name + sshAuthSecretSuffix,
@@ -1280,8 +1300,8 @@ func newSSHAuthSecret(job *kubeflow.MPIJob) (*corev1.Secret, error) {
 		},
 		Type: corev1.SecretTypeSSHAuth,
 		Data: map[string][]byte{
-			corev1.SSHAuthPrivateKey: privatePEM,
-			sshPublicKey:             ssh.MarshalAuthorizedKey(publicKey),
+			corev1.SSHAuthPrivateKey: c.privatePEM,
+			sshPublicKey:             ssh.MarshalAuthorizedKey(c.publicKey),
 		},
 	}, nil
 }
