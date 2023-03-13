@@ -85,6 +85,7 @@ const (
 	sshPrivateKeyFile       = "id_rsa"
 	sshPublicKeyFile        = sshPrivateKeyFile + ".pub"
 	sshAuthorizedKeysFile   = "authorized_keys"
+  poolSize                = 10
 )
 
 const (
@@ -241,9 +242,13 @@ type MPIJobController struct {
 	// Gang scheduler name to use
 	gangSchedulerName string
   poolIndex int
-  podPool [5]string
-  jobName [5] string
-  valid [5] int
+  ownWorkerSize int
+  podPool [poolSize]string
+  orig_jobName [poolSize] string
+  use_jobName [poolSize] string
+  valid [poolSize] int //0 (not valid entry, can overwrite), 1 (valid and not in use), 2 (valid and in use) 
+  own_worker_pod_idx [poolSize] int
+  own_worker_jobName [poolSize] string
   setKey int
   privatePEM []byte
   publicKey ssh.PublicKey
@@ -305,6 +310,7 @@ func NewMPIJobController(
 
 	controller.updateStatusHandler = controller.doUpdateJobStatus
   controller.poolIndex = 0
+  controller.ownWorkerSize = 0
   controller.setKey = 0
 
   msg := fmt.Sprintf("%d workers in pool", controller.poolIndex)
@@ -814,8 +820,10 @@ func keysFromData(data map[string][]byte) []string {
 // MPIJob, or creates one if it doesn't exist.
 func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1.Pod, error) {
 	var workerPods []*corev1.Pod
+  var worker_idx [10]int
   var i            int = 0
-//  var alreadyAdded int = 0
+  var k            int = 0
+  var alreadyAdded int = 0
 	worker := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeWorker]
 	if worker == nil {
 		return workerPods, nil
@@ -840,7 +848,7 @@ func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1
 			if err == nil {
 				if index >= int(*worker.Replicas) {
 //					err = c.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
-/*
+
           for ; i < c.poolIndex; i++ {
             klog.Infof("Compare %s and %s", c.podPool[i], pod.Name)
             if c.podPool[i] == pod.Name {
@@ -850,30 +858,69 @@ func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1
           }
           if alreadyAdded == 0 {
             c.podPool[c.poolIndex] = pod.Name
+            c.orig_jobName[c.poolIndex] = mpiJob.Name
+            c.valid[c.poolIndex] = 1
             c.poolIndex = c.poolIndex+1
             klog.Infof("Adding pod %s to pool",c.podPool[c.poolIndex-1])
             if err != nil {
               return nil, err
             }
           }
-*/
+
 				}
 			}
 		}
     i = 0
 	} else {
     if c.poolIndex > 0 {
-      klog.Infof("MPI job %s going to reuse % from pool", mpiJob.Name, c.podPool[0])
-      i = c.poolIndex
+      idx := 0
+      for i=0; i < c.poolIndex; i++ {
+        reuse := 0
+        if c.valid[i] == 1 {
+          c.valid[i] = 2
+          c.use_jobName[i] = mpiJob.Name
+          reuse = 1
+        } else {
+          if c.valid[i] == 2 && c.use_jobName[i] == mpiJob.Name {
+            reuse = 1
+          }
+        }
+        if reuse == 1 {
+          klog.Infof("Log1: MPI job %s going to reuse %s from pool", mpiJob.Name, c.podPool[idx])
+          idx++
+        }
+      }
+      i = idx
+      klog.Infof("Log1-app i = %d", i)
     }
   }
+  lid := 0
+  for k=0; k<c.ownWorkerSize; k++ {
+    if c.own_worker_jobName[k] == mpiJob.Name {
+      if c.own_worker_pod_idx[k] >= 0 {
+        worker_idx[lid] = c.own_worker_pod_idx[k]
+        lid++
+      }
+    }
+  }
+  kid := 0
+  internal_idx:=0
 	for ; i < int(*worker.Replicas); i++ {
-		pod, err := c.podLister.Pods(mpiJob.Namespace).Get(workerName(mpiJob, i))
+    if lid > 0 && kid < lid {
+      internal_idx = worker_idx[kid]
+      kid++
+    } else {
+      internal_idx = i
+    }
+		pod, err := c.podLister.Pods(mpiJob.Namespace).Get(workerName(mpiJob, internal_idx))
 
 		// If the worker Pod doesn't exist, we'll create it.
 		if errors.IsNotFound(err) {
 			worker := c.newWorker(mpiJob, i)
 			pod, err = c.kubeClient.CoreV1().Pods(mpiJob.Namespace).Create(context.TODO(), worker, metav1.CreateOptions{})
+      c.own_worker_pod_idx[c.ownWorkerSize] = i
+      c.own_worker_jobName[c.ownWorkerSize] = mpiJob.Name
+      c.ownWorkerSize++
 		}
 		// If an error occurs during Get/Create, we'll requeue the item so we
 		// can attempt processing again later. This could have been caused by a
@@ -1187,16 +1234,43 @@ func (c *MPIJobController) doUpdateJobStatus(mpiJob *kubeflow.MPIJob) error {
 // handleObject can discover the MPIJob resource that 'owns' it.
 func newConfigMap(c *MPIJobController, mpiJob *kubeflow.MPIJob, workerReplicas int32) *corev1.ConfigMap {
 	var buffer bytes.Buffer
+  var worker_idx [10]int
   var i            int = 0
+  var k            int = 0
+  var idx          int = 0
 	workersService := mpiJob.Name + workerSuffix
   if c.poolIndex > 0 {
-      klog.Infof("MPI job %s going to reuse % from pool", mpiJob.Name, c.podPool[0])
-      i = c.poolIndex
-      buffer.WriteString(fmt.Sprintf("%s.%s.%s.svc\n", c.podPool[0], "pytorch-mpi-shrink-worker", mpiJob.Namespace))
+    for ; i < c.poolIndex; i++ {
+      if c.valid[i] == 2 && c.use_jobName[i] == mpiJob.Name {
+        klog.Infof("Log2: MPI job %s going to reuse %s from pool", mpiJob.Name, c.podPool[idx])
+        buffer.WriteString(fmt.Sprintf("%s.%s-worker.%s.svc\n", c.podPool[idx], c.orig_jobName[idx], mpiJob.Namespace))
+        idx++
+      }
     }
+    i = idx
+  }
+
+  lid := 0
+  for k=0; k<c.ownWorkerSize; k++ {
+    if c.own_worker_jobName[k] == mpiJob.Name {
+      if c.own_worker_pod_idx[k] >= 0 {
+        worker_idx[lid] = c.own_worker_pod_idx[k]
+        lid++
+      }
+    }
+  }
+
+  kid := 0
+  internal_idx:=0
 
 	for ; i < int(workerReplicas); i++ {
-		buffer.WriteString(fmt.Sprintf("%s%s-%d.%s.%s.svc\n", mpiJob.Name, workerSuffix, i, workersService, mpiJob.Namespace))
+    if lid > 0 && kid < lid {
+      internal_idx = worker_idx[kid]
+      kid++
+    } else {
+      internal_idx = i
+    }
+		buffer.WriteString(fmt.Sprintf("%s%s-%d.%s.%s.svc\n", mpiJob.Name, workerSuffix, internal_idx, workersService, mpiJob.Namespace))
 	}
 
 	return &corev1.ConfigMap{
