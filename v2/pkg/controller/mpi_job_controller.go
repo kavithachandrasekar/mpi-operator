@@ -70,6 +70,7 @@ const (
 	configVolumeName        = "mpi-job-config"
 	configMountPath         = "/etc/mpi"
 	hostfileName            = "hostfile"
+  charmHostfileName       = "nodelist"
 	discoverHostsScriptName = "discover_hosts.sh"
 	sshAuthSecretSuffix     = "-ssh"
 	sshAuthVolume           = "ssh-auth"
@@ -154,8 +155,13 @@ var (
 		{
 			Key:  hostfileName,
 			Path: hostfileName,
-			Mode: newInt32(0444),
+			Mode: newInt32(0666),
 		},
+    {
+      Key:  charmHostfileName,
+      Path: charmHostfileName,
+      Mode: newInt32(0666),
+    },
 		{
 			Key:  discoverHostsScriptName,
 			Path: discoverHostsScriptName,
@@ -738,14 +744,14 @@ func (c *MPIJobController) getOrCreateConfigMap(mpiJob *kubeflow.MPIJob) (*corev
 	}
 
 	// If the ConfigMap is changed, update it
-	if !equality.Semantic.DeepEqual(cm.Data, newCM.Data) {
+//	if !equality.Semantic.DeepEqual(cm.Data, newCM.Data) {
 		cm = cm.DeepCopy()
 		cm.Data = newCM.Data
 		cm, err = c.kubeClient.CoreV1().ConfigMaps(mpiJob.Namespace).Update(context.TODO(), cm, metav1.UpdateOptions{})
 		if err != nil {
 			return nil, err
 		}
-	}
+//	}
 
 	return cm, nil
 }
@@ -1234,6 +1240,7 @@ func (c *MPIJobController) doUpdateJobStatus(mpiJob *kubeflow.MPIJob) error {
 // handleObject can discover the MPIJob resource that 'owns' it.
 func newConfigMap(c *MPIJobController, mpiJob *kubeflow.MPIJob, workerReplicas int32) *corev1.ConfigMap {
 	var buffer bytes.Buffer
+  var charmBuffer bytes.Buffer
   var worker_idx [10]int
   var i            int = 0
   var k            int = 0
@@ -1244,6 +1251,7 @@ func newConfigMap(c *MPIJobController, mpiJob *kubeflow.MPIJob, workerReplicas i
       if c.valid[i] == 2 && c.use_jobName[i] == mpiJob.Name {
         klog.Infof("Log2: MPI job %s going to reuse %s from pool", mpiJob.Name, c.podPool[idx])
         buffer.WriteString(fmt.Sprintf("%s.%s-worker.%s.svc\n", c.podPool[idx], c.orig_jobName[idx], mpiJob.Namespace))
+        charmBuffer.WriteString(fmt.Sprintf("host %s.%s-worker.%s.svc\n", c.podPool[idx], c.orig_jobName[idx], mpiJob.Namespace))
         idx++
       }
     }
@@ -1264,6 +1272,7 @@ func newConfigMap(c *MPIJobController, mpiJob *kubeflow.MPIJob, workerReplicas i
   internal_idx:=0
 
 	for ; i < int(workerReplicas); i++ {
+    klog.Infof("worker i=%d", i);
     if lid > 0 && kid < lid {
       internal_idx = worker_idx[kid]
       kid++
@@ -1271,6 +1280,7 @@ func newConfigMap(c *MPIJobController, mpiJob *kubeflow.MPIJob, workerReplicas i
       internal_idx = i
     }
 		buffer.WriteString(fmt.Sprintf("%s%s-%d.%s.%s.svc\n", mpiJob.Name, workerSuffix, internal_idx, workersService, mpiJob.Namespace))
+    charmBuffer.WriteString(fmt.Sprintf("host %s%s-%d.%s.%s.svc\n", mpiJob.Name, workerSuffix, internal_idx, workersService, mpiJob.Namespace))
 	}
 
 	return &corev1.ConfigMap{
@@ -1286,6 +1296,7 @@ func newConfigMap(c *MPIJobController, mpiJob *kubeflow.MPIJob, workerReplicas i
 		},
 		Data: map[string]string{
 			hostfileName: buffer.String(),
+      charmHostfileName: charmBuffer.String(),
 		},
 	}
 }
